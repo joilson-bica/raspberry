@@ -1,0 +1,20 @@
+[Unit]
+Description=PromptPag - agente TEF (pinpad Stone via AutoTEF)
+# O agente ativa o Slim ao subir, então espera o serviço do AutoTEF.
+After=network-online.target autotef.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/tef-agent
+ExecStart=/usr/bin/node src/index.js
+EnvironmentFile=/etc/tef-agent.env
+Restart=always
+# Dá tempo do Slim voltar antes de tentar de novo (carga de tabelas é lenta).
+RestartSec=10
+User=pi
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
