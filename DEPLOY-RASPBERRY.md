@@ -454,3 +454,119 @@ e substitua tokens/senhas fracos por valores fortes antes de produção.
 | Pagamento aprovado, máquina não liga | Vínculo ESP32/canal e MQTT no backend; não é função do `tef-agent` |
 
 Guarde o token apenas no arquivo protegido. Ao compartilhar logs para diagnóstico, remova informações sensíveis de clientes/transações. Este guia não executa o deploy: os comandos devem ser aplicados e validados no Raspberry Pi real.
+
+## 12. Alternativa manual: iniciar os três processos pelo Desktop
+
+Use `iniciar-tef.sh` e `Iniciar-TEF.desktop` para abrir AutoTEF, agente e proxy
+em **uma janela de terminal**, com os três processos em paralelo. Arquivo
+`.bat` é de Windows; no Raspberry Pi/Linux o lançador é `.sh`.
+
+Essa alternativa substitui a execução desses processos pelo systemd/PM2,
+não deve ser usada junto deles. O proxy foi incluído conforme solicitado,
+mas não é necessário no fluxo com backend + agente. Não envie pagamentos
+diretos pelo proxy enquanto o agente estiver usando o mesmo pinpad.
+
+### Pastas esperadas
+
+```text
+~/Desktop/
+├── iniciar-tef.sh
+├── Iniciar-TEF.desktop
+├── tef/
+│   └── AutoTEF.Service
+└── rasp/
+    ├── tef-agent/
+    │   ├── package.json
+    │   └── .env
+    └── tef-proxy/
+        ├── package.json
+        └── .env
+```
+
+Aqui `rasp` é uma pasta dentro do Desktop, não `/rasp` na raiz do Linux.
+O script localiza as pastas a partir de onde ele próprio está, não do
+terminal em que foi chamado. O atalho assume exatamente `~/Desktop`.
+
+### Preparação, uma vez
+
+Depois de atualizar o repositório em `~/Desktop/rasp`:
+
+```bash
+cd "$HOME/Desktop/rasp/tef-agent"
+npm ci --omit=dev
+cd "$HOME/Desktop/rasp/tef-proxy"
+npm ci --omit=dev
+test -e .env || cp .env.example .env
+chmod 600 .env
+nano .env
+cp "$HOME/Desktop/rasp/iniciar-tef.sh" "$HOME/Desktop/iniciar-tef.sh"
+cp "$HOME/Desktop/rasp/Iniciar-TEF.desktop" "$HOME/Desktop/Iniciar-TEF.desktop"
+chmod +x "$HOME/Desktop/iniciar-tef.sh" "$HOME/Desktop/Iniciar-TEF.desktop" "$HOME/Desktop/tef/AutoTEF.Service"
+```
+
+O `.env` do agente também deve estar preenchido conforme a seção 5, agora
+em `~/Desktop/rasp/tef-agent/.env`. O lançador manual não recebe as variáveis
+privadas que o systemd carrega de `/etc/tef-agent.env`.
+
+O proxy agora tem `npm run start` e carrega seu próprio `.env` via dotenv.
+Configure um token próprio; ele não é o `AGENT_TOKEN`. O exemplo fica em
+loopback (`HOST=127.0.0.1`) e, sem certificados, usa HTTP. O lançador também
+usa loopback quando nenhum `HOST` do proxy foi configurado. Não publique o
+proxy na rede sem configurar autenticação, origens e TLS.
+
+Node/npm precisam estar disponíveis no ambiente da sessão gráfica, não
+apenas em um terminal com NVM inicializado. `setsid`/`flock` normalmente vêm
+no pacote `util-linux`, e `ps` no `procps` do Raspberry Pi OS.
+
+### Executar
+
+Para verificar as pastas, dependências e conflitos sem iniciar nada:
+
+```bash
+bash "$HOME/Desktop/iniciar-tef.sh" --check
+```
+
+Para iniciar:
+
+```bash
+bash "$HOME/Desktop/iniciar-tef.sh"
+```
+
+Ou dê dois cliques em **Iniciar TEF** no Desktop e, se o ambiente gráfico
+solicitar, marque o atalho como confiável/permitido para execução.
+
+O lançador:
+
+1. Recusa outra execução do mesmo lançador, serviços systemd conhecidos,
+   processos Node/AutoTEF detectados e portas já ocupadas. Não encerra
+   processos que já estavam rodando.
+2. Entra em `Desktop/tef` e executa `./AutoTEF.Service`.
+3. Aguarda a porta TCP 8000 abrir, por até 60 segundos. Essa verificação
+   não chama Healthcheck nem conversa com o pinpad.
+4. Executa `npm run start` em `Desktop/rasp/tef-agent` e `Desktop/rasp/tef-proxy`.
+5. Mantém os logs na janela. Se um processo sair, informa o erro, sem
+   reiniciá-lo automaticamente nem reiniciar os outros processos.
+
+Mantenha a janela aberta. **Ctrl+C ou fechar essa janela encerra os processos
+iniciados por ela**; faça isso somente sem pagamento em andamento e após
+conferir eventuais cobranças incertas. O lançador não concilia pagamentos
+nem desbloqueia com segurança uma transação desconhecida.
+
+Se o Slim usa outra porta ou precisa de outro limite de inicialização:
+
+```bash
+AUTOTEF_PORT=8000 STARTUP_TIMEOUT_SECONDS=120 bash "$HOME/Desktop/iniciar-tef.sh"
+```
+
+Isso altera apenas a espera do lançador. `AUTOTEF_URL` do agente/proxy e a
+configuração real do Slim devem apontar para a mesma porta.
+
+Para validar o lançador com comandos/processos simulados, sem iniciar Slim
+ou acessar o pinpad, na raiz do repositório `rasp`:
+
+```bash
+node --test test/launcher.test.cjs
+```
+
+No Windows, os testes aceitam `BASH_FOR_TESTS` com o caminho do Bash do Git;
+a execução real dos três processos é exclusiva do Linux.

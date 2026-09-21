@@ -3,6 +3,7 @@ set -u
 
 fail() {
   printf 'ERRO: %s\n' "$*" >&2
+  if [[ -t 0 ]]; then read -r -p 'Pressione Enter para fechar...' _; fi
   exit 1
 }
 
