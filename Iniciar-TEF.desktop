@@ -1,0 +1,9 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Iniciar TEF
+Comment=Inicia AutoTEF, agente e proxy em uma janela de terminal
+Exec=/bin/bash -c "cd && exec /bin/bash Desktop/iniciar-tef.sh"
+Terminal=true
+Icon=utilities-terminal
+Categories=Utility;

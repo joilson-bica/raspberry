@@ -1,0 +1,16 @@
+{
+  "name": "promptpag-tef-proxy",
+  "version": "0.1.0",
+  "private": true,
+  "type": "commonjs",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "start": "node index.js",
+    "check": "node --check index.js"
+  },
+  "dependencies": {
+    "dotenv": "16.6.1"
+  }
+}

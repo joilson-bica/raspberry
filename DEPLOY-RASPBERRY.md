@@ -17,7 +17,7 @@ Não instale backend, Postgres, Adminer, Mosquitto, `admin/` ou `tef-proxy` para
 | Lavanderia | Dona Chica Lavanderia |
 | `LAUNDRY_ID` | `2f092271-3372-41ed-9626-4a5afc2ef99f` |
 | `AGENT_ID` | `dona-chica-totem-01` — exclusivo deste Pi |
-| Backend de produção | `https://api-lavanderia.promptpag.com` |
+| Backend de produção | `https://api.promptpag.com` |
 | Frontend de produção | `https://app-lavanderia.promptpag.com` |
 | AutoTEF local | `http://127.0.0.1:8000` |
 | Token do agente | O mesmo valor de `TEF_AGENT_TOKEN` no backend |
@@ -25,7 +25,7 @@ Não instale backend, Postgres, Adminer, Mosquitto, `admin/` ou `tef-proxy` para
 | Parceiro / modo PDV | Devem corresponder à instalação do Slim |
 | Porta do pinpad | Confirmar no Pi; normalmente `/dev/ttyACM0` |
 
-Se estiver usando homologação, troque **as duas URLs públicas** pelas versões com `-hml` e use o token/credenciamento daquele ambiente. Não coloque `:4000` nem `/tef` em `BACKEND_URL`: a conexão usa HTTPS pelo proxy e o agente já define o caminho `/tef`.
+Se estiver usando homologação, use as URLs reais publicadas para esse ambiente e o token/credenciamento correspondente, sem deduzir outro domínio automaticamente. Não coloque `:4000` nem `/tef` em `BACKEND_URL`: a conexão usa HTTPS pelo proxy e o agente já define o caminho `/tef`.
 
 O frontend publicado deve usar o mesmo UUID da lavanderia, backend habilitado e pagamento `auto`, não `autotef` direto. Essas configurações pertencem ao deploy do frontend; não são definidas no Chromium nem em um `.env` do frontend no Pi.
 
@@ -113,11 +113,11 @@ sudo mkdir -p /opt/promptpag-pi
 sudo chown "$(id -un):$(id -gn)" /opt/promptpag-pi
 git clone URL_DO_REPOSITORIO_RASPBERRY /opt/promptpag-pi
 cd /opt/promptpag-pi/tef-agent
-npm install --omit=dev
+npm ci --omit=dev
 npm run check
 ```
 
-**Não há build do agente:** ele executa `src/index.js` diretamente. Este repositório ainda não contém `tef-agent/package-lock.json`; por isso a primeira instalação usa `npm install`, não `npm ci`. Guarde o lockfile gerado e versione-o após revisão para reproduzir as mesmas versões em outros Pis. Com um lockfile disponível e consistente, use `npm ci --omit=dev` nas instalações seguintes.
+**Não há build do agente:** ele executa `src/index.js` diretamente. O `package-lock.json` está versionado, incluindo `dotenv`; use `npm ci --omit=dev` para instalar as mesmas versões. Não basta puxar o código sem atualizar as dependências.
 
 ## 5. Configurar o ambiente do agente
 
@@ -136,7 +136,7 @@ sudoedit /etc/tef-agent.env
 Preencha com os valores abaixo, substituindo os três placeholders e ajustando a serial/modo PDV se necessário:
 
 ```env
-BACKEND_URL=https://api-lavanderia.promptpag.com
+BACKEND_URL=https://api.promptpag.com
 AGENT_TOKEN=SUBSTITUA_PELO_TEF_AGENT_TOKEN_DO_BACKEND
 AGENT_ID=dona-chica-totem-01
 LAUNDRY_ID=2f092271-3372-41ed-9626-4a5afc2ef99f
@@ -176,6 +176,28 @@ sudo chown root:root /etc/tef-agent.env
 sudo chmod 600 /etc/tef-agent.env
 sudo stat -c '%U:%G %a %n' /etc/tef-agent.env
 ```
+
+### Execução direta com `.env`, sem systemd
+
+Se preferir iniciar por `npm start` ou PM2, coloque o arquivo em
+`/opt/promptpag-pi/tef-agent/.env`, ao lado do `package.json`, usando as mesmas
+variáveis acima. O `config.js` carrega esse arquivo via `dotenv`, inclusive
+quando o processo é iniciado de outro diretório:
+
+```bash
+cd /opt/promptpag-pi/tef-agent
+npm ci --omit=dev
+test -e .env || cp .env.example .env
+chmod 600 .env
+nano .env
+npm start
+```
+
+Escolha um único gerenciador. Não rode esse comando se o agente já estiver
+ativo no systemd ou PM2. Variáveis exportadas no processo têm prioridade
+sobre o `.env`: com systemd, altere `/etc/tef-agent.env`; com PM2, verifique
+se há valores antigos no ambiente do processo. Espaços ao redor de `=` são
+aceitos pelo dotenv, mas prefira o formato `CHAVE=valor`.
 
 ## 6. Iniciar automaticamente com systemd
 
@@ -292,8 +314,8 @@ Não configure as duas opções ao mesmo tempo. Se a sessão usar outro composit
 Faça as consultas abaixo a partir do Pi:
 
 ```bash
-curl --max-time 15 -i https://api-lavanderia.promptpag.com/status
-curl --max-time 15 -i https://api-lavanderia.promptpag.com/laundries/2f092271-3372-41ed-9626-4a5afc2ef99f
+curl --max-time 15 -i https://api.promptpag.com/status
+curl --max-time 15 -i https://api.promptpag.com/laundries/2f092271-3372-41ed-9626-4a5afc2ef99f
 sudo journalctl -u tef-agent.service -f
 ```
 
@@ -346,9 +368,79 @@ sudo systemctl start tef-agent.service
 sudo journalctl -u tef-agent.service -n 100 --no-pager
 ```
 
-Use `npm ci` nessa atualização apenas se o lockfile estiver disponível e consistente com o `package.json`; se ainda não estiver, use `npm install --omit=dev`. Se o Git informar conflito, preserve as alterações locais e resolva antes de continuar. Não reinicie o agente no meio de um pagamento: o pinpad é exclusivo e o cache de resultados do agente é apenas em memória.
+O lockfile versionado deve acompanhar o `package.json` nessa atualização. Se o Git informar conflito, preserve as alterações locais e resolva antes de continuar. Não reinicie o agente no meio de um pagamento: o pinpad é exclusivo e o cache de resultados do agente é apenas em memória.
 
-## 10. Diagnóstico rápido
+## 10. Quando aparece `websocket error`
+
+A conexão com MQTT e a conexão do agente TEF são independentes. O log do
+backend **conectado ao broker MQTT** não confirma que o WebSocket está
+funcionando. `MQTT_USERNAME`/`MQTT_PASSWORD` são credenciais do broker,
+enquanto `AGENT_TOKEN` deve corresponder a `TEF_AGENT_TOKEN` do backend.
+Definir usuário/senha no `.env` do backend não cria usuários no Mosquitto;
+se o broker permitir acesso anônimo, a conexão pode funcionar sem validar
+as credenciais informadas.
+
+O domínio informado para esta instalação é `https://api.promptpag.com`.
+Na verificação externa, a API HTTP respondeu por Nginx, mas a tentativa de
+upgrade em `/tef/` retornou HTTP 400. Esse erro acontece antes de enviar o
+token Socket.IO; a principal verificação é o encaminhamento do upgrade no
+proxy. Uma senha de MQTT diferente não corrige esse handshake.
+
+### Verificação na VPS: Nginx
+
+Esta é uma dependência de acesso ao Pi, não um serviço a instalar nele.
+No **bloco HTTPS existente** do Nginx com `server_name api.promptpag.com`,
+adicione ou ajuste a localização do WebSocket. Preserve as configurações
+de certificado e as outras rotas; não crie blocos duplicados para o domínio:
+
+```nginx
+location /tef/ {
+    proxy_pass http://127.0.0.1:4000;
+    proxy_http_version 1.1;
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection "upgrade";
+    proxy_set_header Host $host;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_read_timeout 300s;
+    proxy_send_timeout 300s;
+    proxy_buffering off;
+}
+```
+
+O `proxy_pass` está **sem uma barra/caminho após a porta** para preservar
+`/tef/` até o backend. Confirme o upstream caso sua instalação use outra
+porta ou outro host. Não precisa trocar Nginx por Caddy.
+
+Na VPS, valide a configuração antes de recarregar:
+
+```bash
+sudo nginx -t && sudo systemctl reload nginx
+```
+
+Do Pi, teste apenas o upgrade, sem expor token e sem registrar outro agente:
+
+```bash
+curl --http1.1 --max-time 5 -D - -o /dev/null \
+  -H 'Connection: Upgrade' \
+  -H 'Upgrade: websocket' \
+  -H 'Sec-WebSocket-Version: 13' \
+  -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==' \
+  'https://api.promptpag.com/tef/?EIO=4&transport=websocket'
+```
+
+O esperado é **HTTP 101 Switching Protocols**. Depois do 101, o curl pode
+encerrar por timeout porque a conexão fica aberta; isso não é falha de
+upgrade. HTTP 400/404/502 indica que ainda é necessário verificar o proxy,
+o caminho ou o backend. Se funcionar em `http://127.0.0.1:4000/tef/` na VPS,
+com os mesmos headers e parâmetros, mas não pelo domínio público, revise
+os proxies intermediários.
+
+Após corrigir o upgrade, reinicie somente a instância real do agente e
+confira o handshake autenticado nos logs. Use o mesmo token nos dois lados
+e substitua tokens/senhas fracos por valores fortes antes de produção.
+
+## 11. Diagnóstico rápido
 
 | Sintoma | Conferir no Pi |
 |---|---|

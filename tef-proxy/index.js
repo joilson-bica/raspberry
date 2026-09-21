@@ -8,7 +8,7 @@
 // Este proxy fica na frente do Slim e, com um certificado válido, expõe as
 // mesmas rotas por HTTPS — a página passa a chamar https://<host>/api/Pay.
 //
-// Sem dependências: só a stdlib do Node (>= 18).
+// Node >= 18: proxy via stdlib, com dotenv para carregar o ambiente local.
 //
 // Uso:
 //   node index.js
@@ -21,6 +21,8 @@ const http = require("node:http");
 const https = require("node:https");
 const fs = require("node:fs");
 const { URL } = require("node:url");
+const path = require("node:path");
+require("dotenv").config({ path: path.join(__dirname, ".env"), quiet: true });
 
 const AUTOTEF_URL = process.env.AUTOTEF_URL || "http://127.0.0.1:8000";
 const PORT = Number(process.env.PORT || 8443);

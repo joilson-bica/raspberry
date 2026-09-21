@@ -2,7 +2,27 @@
 
 Proxy reverso para o **AutoTEF Slim** (Stone) que roda no Raspberry Pi.
 
-Arquivo único, **zero dependências** (só a stdlib do Node >= 18).
+Node >= 18. O proxy usa a stdlib e carrega o `.env` local com `dotenv`.
+
+Instalação e inicialização pela pasta `tef-proxy`:
+
+```bash
+npm ci --omit=dev
+test -e .env || cp .env.example .env
+chmod 600 .env
+nano .env
+npm run start
+```
+
+O `.env` fica ao lado do `package.json`; variáveis exportadas no processo
+prevalecem sobre o arquivo. O exemplo escuta somente em `127.0.0.1`.
+Configure origem/token e certificados antes de disponibilizar acesso externo.
+O token do proxy não é o `AGENT_TOKEN` do agente TEF.
+
+O lançador `../iniciar-tef.sh` também executa esse `npm run start`. Com o
+frontend usando backend + agente, o proxy não é necessário para cobrar;
+não misture pagamentos diretos pelo proxy com pagamentos pelo agente,
+pois a exclusão mútua do agente não cobre clientes HTTP externos.
 
 ## Por que existe
 
