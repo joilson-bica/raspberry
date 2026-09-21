@@ -1,8 +1,13 @@
+import dotenv from "dotenv";
+import { fileURLToPath } from "node:url";
+
 // Configuração do agente, toda por variável de ambiente.
 //
 // Em produção o systemd injeta as variáveis (ver deploy/tef-agent.service).
-// Em desenvolvimento, `node --env-file=.env src/index.js` (Node >= 20.6)
-// ou exporte na shell.
+// O .env na raiz do agente é carregado também com npm start/node/PM2.
+// Variáveis já injetadas pelo sistema têm prioridade sobre o arquivo.
+
+dotenv.config({ path: fileURLToPath(new URL("../.env", import.meta.url)), quiet: true });
 
 function required(name) {
   const value = process.env[name];

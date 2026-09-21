@@ -43,8 +43,17 @@ export class AutotefUnreachableError extends Error {
   }
 }
 
+export class AutotefResultUnknownError extends Error {
+  constructor() {
+    super("Resultado do pagamento desconhecido: AutoTEF respondeu sem comprovante válido");
+    this.name = "AutotefResultUnknownError";
+    this.code = "AGENT_RESULT_UNKNOWN";
+  }
+}
+
 async function call(path, { method = "GET", body, timeout }) {
   let res;
+  let text;
   try {
     res = await fetch(`${config.autotefUrl}${path}`, {
       method,
@@ -52,11 +61,11 @@ async function call(path, { method = "GET", body, timeout }) {
       body: body ? JSON.stringify(body) : undefined,
       signal: AbortSignal.timeout(timeout),
     });
+    text = await res.text();
   } catch (err) {
     throw new AutotefUnreachableError(err);
   }
 
-  const text = await res.text();
   const payload = text ? safeParse(text) : undefined;
 
   if (!res.ok) throw new AutotefError(res.status, payload ?? null);
@@ -135,11 +144,17 @@ export async function pay({ amount, method, installments }) {
   return normalizeReceipt(response);
 }
 
-// Achata { receipt, card } no contrato que o backend persiste.
+// Achata { receipt, card } ou o comprovante na raiz no contrato que o backend persiste.
 function normalizeReceipt(response) {
-  const receipt = response?.receipt ?? null;
+  const receipt = response?.receipt ?? response;
   const card = response?.card ?? null;
-  if (!receipt) throw new Error("AutoTEF aprovou sem devolver o comprovante");
+  if (
+    !receipt || typeof receipt !== "object" || Array.isArray(receipt) ||
+    typeof receipt.acquirerTransactionKey !== "string" ||
+    !receipt.acquirerTransactionKey.trim()
+  ) {
+    throw new AutotefResultUnknownError();
+  }
 
   return {
     acquirerTransactionKey: receipt.acquirerTransactionKey,
@@ -148,7 +163,7 @@ function normalizeReceipt(response) {
     amount: receipt.amount,
     brandName: receipt.brandName ?? null,
     cardholderName: receipt.cardholderName ?? null,
-    installments: receipt.totalNumberOfPayments ?? 1,
+    installments: receipt.totalNumberOfPayments > 0 ? receipt.totalNumberOfPayments : 1,
     installmentType: receipt.installmentType ?? 1,
     transactionType: transactionTypeOf(receipt.transactionType),
     // Máscara do receipt (sem BIN): exibição.
@@ -173,7 +188,7 @@ function transactionTypeOf(value) {
 
 // Texto do device → rótulo estável para o backend/dashboard.
 function readingTypeOf(value) {
-  if (!value) return null;
+  if (typeof value !== "string" || !value) return null;
   if (value.includes("Proximity")) return "nfc";
   if (value.includes("Contactless")) return "nfc";
   if (value.includes("Contact")) return "chip";
@@ -223,7 +238,8 @@ export async function pinpadMessage({ message, secondMessage, formatMessage }) {
     return { ok: true };
   } catch (err) {
     // Mensagem no display é cosmética: nunca deve derrubar uma transação.
-    log.warn(`Falha ao escrever no pinpad: ${err.message}`);
-    return { ok: false, error: err.message };
+    const code = err.code ?? "AUTOTEF_ERROR";
+    log.warn(`Falha ao escrever no pinpad: ${JSON.stringify({ code })}`);
+    return { ok: false, error: { code, message: "Falha ao escrever no pinpad" } };
   }
 }

@@ -16,41 +16,10 @@ import * as autotef from "./autotef.js";
 // uma rede de segurança: se a conexão cair entre o fim da transação e o ACK,
 // o backend recebe o resultado no reconnect. Dedupe pelo requestId.
 
-// O pinpad é um recurso único: nunca duas transações ao mesmo tempo.
-let inFlight = null;
-
-// Último healthcheck bem-sucedido. O heartbeat republica ISTO, em vez de
-// consultar o Slim de novo — ver a nota sobre o pinpad no README.
-let lastHealth = null;
-let lastHealthAt = 0;
-// Sobe para true depois de uma falha: o próximo momento ocioso reconsulta.
-let healthDirty = true;
-
-// Resultados recentes, para responder reenvios do mesmo requestId.
-const results = new Map();
-
-function remember(requestId, payload) {
-  results.set(requestId, payload);
-  while (results.size > config.resultCacheSize) {
-    results.delete(results.keys().next().value);
-  }
-}
-
-// Uma transação bem-sucedida prova que o pinpad responde — melhor sinal do
-// que qualquer sondagem. Só marcamos para reconsultar quando o erro sugere
-// que a comunicação com o device se perdeu.
-function noteOutcome(result) {
-  if (result?.ok) {
-    lastHealthAt = Date.now();
-    healthDirty = false;
-    return;
-  }
-  const code = result?.error?.code;
-  // G002 = Slim sem ativação; AGENT_UNREACHABLE = Slim fora do ar.
-  if (code === "AGENT_UNREACHABLE" || code === "G002") healthDirty = true;
-}
-
 function describe(err) {
+  if (err?.code === "AGENT_RESULT_UNKNOWN") {
+    return { code: "AGENT_RESULT_UNKNOWN", message: "Resultado do pagamento desconhecido" };
+  }
   if (err instanceof autotef.AutotefError) {
     return { code: err.code ?? "AUTOTEF_ERROR", message: err.message, reason: err.reason };
   }
@@ -60,41 +29,122 @@ function describe(err) {
   return { code: "AGENT_ERROR", message: err?.message ?? String(err) };
 }
 
-// Envolve os handlers que usam o pinpad: idempotência + exclusão mútua.
-async function exclusive(requestId, label, task) {
-  if (!requestId) {
-    return { ok: false, error: { code: "BAD_REQUEST", message: "requestId é obrigatório" } };
-  }
+function correlate(payload, result) {
+  return { ...result, requestId: payload?.requestId ?? null, paymentId: payload?.paymentId ?? null };
+}
 
-  const cached = results.get(requestId);
-  if (cached) {
-    log.info(`${label} ${requestId}: devolvendo resultado em cache`);
-    return cached;
-  }
+function acknowledge(ack, result) {
+  if (typeof ack === "function") ack(result);
+}
 
-  if (inFlight) {
-    log.warn(`${label} ${requestId}: pinpad ocupado por ${inFlight}`);
-    return {
-      ok: false,
-      error: { code: "AGENT_BUSY", message: "O pinpad já está processando outra transação" },
-    };
-  }
+function diagnose(event, result) {
+  log.info(JSON.stringify({ event, requestId: result.requestId, paymentId: result.paymentId,
+    ok: result.ok, code: result.error?.code ?? null }));
+}
 
-  inFlight = requestId;
-  try {
-    const payload = await task();
-    remember(requestId, payload);
-    return payload;
-  } catch (err) {
-    const payload = { ok: false, error: describe(err) };
-    remember(requestId, payload);
-    return payload;
-  } finally {
-    inFlight = null;
+function connectionCategory(value) {
+  if (typeof value !== "string") return "unknown connection failure";
+  const message = value.toLowerCase();
+  const categories = [
+    "websocket error", "xhr poll error", "xhr post error", "transport error",
+    "transport close", "ping timeout", "io server disconnect", "io client disconnect",
+    "forced close", "forced server close", "parse error", "timeout",
+  ];
+  const category = categories.find((candidate) => message.includes(candidate));
+  if (category) return category;
+  if (/unauthori[sz]ed|forbidden|authentication|invalid token|token inválido/.test(message)) {
+    return "authentication error";
   }
+  return "unknown connection failure";
 }
 
 export function createAgent() {
+  // O pinpad é um recurso único: nunca duas operações no Slim ao mesmo tempo.
+  let inFlight = null;
+  let uncertain = false;
+
+  // Último healthcheck bem-sucedido. O heartbeat republica ISTO, em vez de
+  // consultar o Slim de novo — ver a nota sobre o pinpad no README.
+  let lastHealth = null;
+  let lastHealthAt = 0;
+  // Sobe para true depois de uma falha: o próximo momento ocioso seguro reconsulta.
+  let healthDirty = true;
+
+  // Resultados recentes, para responder reenvios do mesmo requestId.
+  const results = new Map();
+
+  function remember(requestId, payload) {
+    results.set(requestId, payload);
+    while (results.size > config.resultCacheSize) {
+      results.delete(results.keys().next().value);
+    }
+  }
+
+  // Uma transação bem-sucedida prova que o pinpad responde — melhor sinal do
+  // que qualquer sondagem. Só marcamos para reconsultar quando o erro sugere
+  // que a comunicação com o device se perdeu.
+  function noteOutcome(result) {
+    if (result?.ok) {
+      lastHealthAt = Date.now();
+      healthDirty = false;
+      return;
+    }
+    const code = result?.error?.code;
+    // G002 = Slim sem ativação; AGENT_UNREACHABLE = falha de comunicação com Slim.
+    if (code === "AGENT_UNREACHABLE" || code === "G002") healthDirty = true;
+    if (["AGENT_UNREACHABLE", "AGENT_RESULT_UNKNOWN", "AGENT_ERROR"].includes(code)) uncertain = true;
+  }
+
+  function busyResult() {
+    return { ok: false, error: { code: "AGENT_BUSY", message: "O pinpad está ocupado" } };
+  }
+
+  async function withSerial(label, task) {
+    if (inFlight) return busyResult();
+    inFlight = label;
+    try {
+      publishStatus();
+      return await task();
+    } finally {
+      inFlight = null;
+      publishStatus();
+    }
+  }
+
+  // Envolve os handlers que usam o pinpad: idempotência + exclusão mútua.
+  async function exclusive(payload, label, task) {
+    const { requestId, paymentId } = payload ?? {};
+    if ([requestId, paymentId].some((id) => typeof id !== "string" || !id.trim())) {
+      return correlate(payload, { ok: false, error: { code: "BAD_REQUEST", message: "requestId e paymentId devem ser strings não vazias" } });
+    }
+
+    const cached = results.get(requestId);
+    if (cached) {
+      if (cached.label !== label || cached.result.paymentId !== paymentId) {
+        return correlate(payload, { ok: false, error: { code: "BAD_REQUEST", message: "requestId já utilizado para outro pagamento ou operação" } });
+      }
+      return cached.result;
+    }
+    if (uncertain) {
+      return correlate(payload, {
+        ok: false, error: { code: "AGENT_RESULT_UNKNOWN", message: "Agente bloqueado após resultado incerto; requer verificação do operador" },
+      });
+    }
+
+    const result = await withSerial(label, async () => {
+      let outcome;
+      try {
+        outcome = await task();
+      } catch (err) {
+        outcome = { ok: false, error: describe(err) };
+      }
+      noteOutcome(outcome);
+      remember(requestId, { label, result: correlate(payload, outcome) });
+      return outcome;
+    });
+    return correlate(payload, result);
+  }
+
   const socket = io(config.backendUrl, {
     path: "/tef",
     transports: ["websocket"],
@@ -113,7 +163,7 @@ export function createAgent() {
   // Consulta o Slim só quando vale a pena. NUNCA durante uma transação: a
   // comunicação com o pinpad é serial e exclusiva.
   const probeHealth = async ({ force = false } = {}) => {
-    if (inFlight) return lastHealth;
+    if (inFlight || uncertain) return lastHealth;
 
     const age = Date.now() - lastHealthAt;
 
@@ -130,17 +180,19 @@ export function createAgent() {
     // martelar o device.
     if (lastHealthAt && age < config.healthcheckMinGapMs) return lastHealth;
 
-    try {
-      lastHealth = await autotef.healthcheck();
-      lastHealthAt = Date.now();
-      healthDirty = false;
-      log.debug("Healthcheck OK");
-    } catch (err) {
-      lastHealth = null;
-      lastHealthAt = Date.now();
-      healthDirty = true;
-      log.warn(`Healthcheck falhou: ${err.message}`);
-    }
+    await withSerial("healthcheck", async () => {
+      try {
+        lastHealth = await autotef.healthcheck();
+        lastHealthAt = Date.now();
+        healthDirty = false;
+        log.debug("Healthcheck OK");
+      } catch (err) {
+        lastHealth = null;
+        lastHealthAt = Date.now();
+        healthDirty = true;
+        log.warn(`Healthcheck falhou: ${JSON.stringify({ code: describe(err).code })}`);
+      }
+    });
     return lastHealth;
   };
 
@@ -149,8 +201,8 @@ export function createAgent() {
     socket.emit("tef.status", {
       agentId: config.agentId,
       laundryId: config.laundryId,
-      activated: Boolean(lastHealth),
-      busy: Boolean(inFlight),
+      activated: !uncertain && Boolean(lastHealth),
+      busy: uncertain || Boolean(inFlight),
       stoneCode: lastHealth?.stoneCode ?? config.stoneCode,
       partnerName: lastHealth?.partnerName ?? config.partnerName,
       connectionName: lastHealth?.connectionName ?? config.connectionName,
@@ -164,31 +216,29 @@ export function createAgent() {
   };
 
   socket.on("connect", () => {
-    log.info(`Conectado ao backend (${config.backendUrl}) como ${config.agentId}`);
+    log.info(`Conectado ao backend como ${config.agentId}`);
     void probeHealth().then(publishStatus);
   });
 
   socket.on("connect_error", (err) => {
     // Token inválido cai aqui: o backend recusa o handshake.
-    log.error(`Falha ao conectar no backend: ${err.message}`);
+    log.error(`Falha ao conectar no backend: ${connectionCategory(err?.message)}`);
   });
 
   socket.on("disconnect", (reason) => {
-    log.warn(`Desconectado do backend: ${reason}`);
+    log.warn(`Desconectado do backend: ${connectionCategory(reason)}`);
   });
 
   // ---- Pagamento no cartão ---------------------------------------------------
 
   socket.on("tef.pay", async (payload, ack) => {
     const { requestId, paymentId, amount, method, installments } = payload ?? {};
-    log.info(
-      `tef.pay ${requestId}: ${method} R$ ${amount} (pagamento ${paymentId})` +
-        (installments > 1 ? ` em ${installments}x` : "")
-    );
-
-    const result = await exclusive(requestId, "tef.pay", async () => {
-      if (typeof amount !== "number" || amount <= 0) {
+    const result = await exclusive(payload, "tef.pay", async () => {
+      if (typeof amount !== "number" || !Number.isFinite(amount) || amount <= 0) {
         return { ok: false, error: { code: "BAD_REQUEST", message: "amount inválido" } };
+      }
+      if (!["debit", "credit", "voucher"].includes(method)) {
+        return { ok: false, error: { code: "BAD_REQUEST", message: "method inválido" } };
       }
 
       // Avisa o backend que o cliente já pode usar o cartão. O totem mostra
@@ -196,68 +246,84 @@ export function createAgent() {
       socket.emit("tef.progress", { requestId, paymentId, stage: "waiting_card" });
 
       const receipt = await autotef.pay({ amount, method, installments });
-      return { ok: true, requestId, paymentId, approved: true, receipt };
+      return { ok: true, approved: true, receipt };
     });
 
     // A transação é o melhor sinal de saúde que existe: aprovou, o pinpad
-    // está vivo. Falhou, reconsulta no próximo momento ocioso.
-    noteOutcome(result);
+    // está vivo. Falhou sem incerteza, reconsulta no próximo momento ocioso.
+    diagnose("tef.pay", result);
 
     // Rede de segurança: se o ACK não chegar, o backend recebe por aqui.
-    socket.emit("tef.result", { ...result, requestId, paymentId });
-    ack?.(result);
+    socket.emit("tef.result", result);
+    acknowledge(ack, result);
   });
 
   // ---- Cancelamento / estorno ------------------------------------------------
 
   socket.on("tef.cancel", async (payload, ack) => {
-    const { requestId, paymentId, acquirerTransactionKey, amount, transactionType, panMask } =
-      payload ?? {};
-    log.info(`tef.cancel ${requestId}: ATK ${acquirerTransactionKey} R$ ${amount}`);
-
-    const result = await exclusive(requestId, "tef.cancel", async () => {
-      if (!acquirerTransactionKey) {
+    const { acquirerTransactionKey, amount, transactionType, panMask } = payload ?? {};
+    const result = await exclusive(payload, "tef.cancel", async () => {
+      if (typeof acquirerTransactionKey !== "string" || !acquirerTransactionKey.trim()) {
         return {
           ok: false,
           error: { code: "BAD_REQUEST", message: "acquirerTransactionKey é obrigatório" },
         };
       }
       await autotef.cancel({ acquirerTransactionKey, amount, transactionType, panMask });
-      return { ok: true, requestId, paymentId, cancelled: true };
+      return { ok: true, cancelled: true };
     });
 
-    noteOutcome(result);
+    diagnose("tef.cancel", result);
 
-    socket.emit("tef.result", { ...result, requestId, paymentId });
-    ack?.(result);
+    socket.emit("tef.result", result);
+    acknowledge(ack, result);
   });
 
   // ---- Utilitários -----------------------------------------------------------
 
   socket.on("tef.pinpad.message", async (payload, ack) => {
-    const result = await autotef.pinpadMessage(payload ?? {});
-    ack?.(result);
+    let outcome;
+    if (inFlight) outcome = busyResult();
+    else if (uncertain) outcome = {
+      ok: false, error: { code: "AGENT_RESULT_UNKNOWN", message: "Mensagem ignorada após resultado incerto" },
+    };
+    else {
+      outcome = await withSerial("pinpad.message", async () => {
+        try {
+          return await autotef.pinpadMessage(payload ?? {});
+        } catch (err) {
+          return { ok: false, error: describe(err) };
+        }
+      });
+    }
+    const result = correlate(payload, outcome);
+    diagnose("tef.pinpad.message", result);
+    acknowledge(ack, result);
   });
 
   // O backend pode pedir uma consulta real (`force: true`), mas o intervalo
-  // mínimo continua valendo e uma transação em curso tem prioridade.
+  // mínimo continua valendo e uma operação em curso ou incerta impede a sondagem.
   socket.on("tef.healthcheck", async (payload, ack) => {
-    if (inFlight) {
-      ack?.({ ok: true, busy: true, cached: true, health: lastHealth });
+    if (inFlight || uncertain) {
+      const result = correlate(payload, { ok: !uncertain && Boolean(lastHealth), busy: uncertain || Boolean(inFlight), cached: true, health: lastHealth });
+      diagnose("tef.healthcheck", result);
+      acknowledge(ack, result);
       return;
     }
     const health = await probeHealth({ force: payload?.force === true });
-    ack?.({
-      ok: Boolean(health),
+    const result = correlate(payload, {
+      ok: !uncertain && Boolean(health),
       health,
-      busy: false,
+      busy: uncertain || Boolean(inFlight),
       healthAgeMs: lastHealthAt ? Date.now() - lastHealthAt : null,
     });
+    diagnose("tef.healthcheck", result);
+    acknowledge(ack, result);
   });
 
   const heartbeat = setInterval(() => {
     if (!socket.connected) return;
-    // Modo interval reconsulta quando ocioso; lazy só se algo falhou antes.
+    // Modo interval reconsulta quando ocioso e seguro; lazy só se algo falhou antes.
     void probeHealth().then(publishStatus);
   }, config.heartbeatMs);
 

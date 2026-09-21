@@ -3,7 +3,7 @@
 Agente que roda no **Raspberry Pi do totem**. Recebe eventos do backend por
 socket e executa a transação no **pinpad** através do AutoTEF Slim (Stone).
 
-Node >= 18, uma única dependência (`socket.io-client`), **sem build**.
+Node >= 18, dependências `socket.io-client` e `dotenv`, **sem build**.
 
 ## Por que existe
 
@@ -45,18 +45,42 @@ sudo systemctl enable --now tef-agent
 journalctl -u tef-agent -f
 ```
 
-Desenvolvimento (Node >= 20.6):
+Execução direta, sem systemd (não rode junto de outra instância):
 
 ```bash
-cp .env.example .env
-node --env-file=.env src/index.js
+npm ci --omit=dev
+test -e .env || cp .env.example .env
+chmod 600 .env
+nano .env
+npm start
 ```
+
+`src/config.js` importa `dotenv` e carrega automaticamente o `.env` ao lado
+do `package.json`, independentemente do diretório de onde o Node foi iniciado.
+Variáveis já presentes no processo têm prioridade: com systemd, edite
+`/etc/tef-agent.env`; ao usar PM2, confira também o ambiente salvo no processo.
+Não é necessário `--env-file` nem copiar o arquivo para `src/`.
+Espaços ao redor de `=` são aceitos pelo dotenv, mas prefira `CHAVE=valor`.
+
+Para validar sem conectar ao backend/pinpad:
+
+```bash
+npm run check
+npm test
+```
+
+Os testes usam somente arquivos temporários e HTTP/socket falsos, com dados
+fictícios. Os testes de agente/cliente substituem os imports de configuração
+antes de carregar o código: não leem o `.env` real nem acessam Slim, banco ou
+backend. Cobrem carregamento de configuração, precedência do ambiente,
+normalização do comprovante, timeout durante leitura do corpo, correlação
+ACK/evento/cache e concorrência com respostas propositalmente adiadas.
 
 ## Variáveis de ambiente
 
 | Variável | Default | Descrição |
 |:--|:--|:--|
-| `BACKEND_URL` | — | **Obrigatória.** Ex.: `https://api-lavanderia.promptpag.com` |
+| `BACKEND_URL` | — | **Obrigatória.** Ex.: `https://api.promptpag.com` |
 | `AGENT_TOKEN` | — | **Obrigatória.** Igual ao `TEF_AGENT_TOKEN` do backend |
 | `AGENT_ID` | — | **Obrigatória.** Identifica o totem (ex.: `totem-01`) |
 | `LAUNDRY_ID` | — | **Obrigatória.** Lavanderia a que este totem pertence |
@@ -81,14 +105,17 @@ que importa.
 
 Por isso o agente segue três regras:
 
-- **Nunca sonda durante uma transação.** `probeHealth()` devolve o cache na
-  hora se houver algo em andamento — inclusive quando o backend pede.
-- **O heartbeat não toca no device.** A cada 30s o agente publica
-  `tef.status` com o **último estado conhecido** e a idade dele
-  (`healthAgeMs`). É presença no socket, não sondagem no pinpad.
+- **Nunca sonda durante outra operação.** `probeHealth()` devolve o cache na
+  hora se houver algo em andamento — inclusive quando o backend pede. A
+  sondagem reserva a mesma serial que Pay, Cancel e mensagens antes do HTTP.
+- **O heartbeat publica cache.** A cada 30s o agente publica `tef.status`
+  com o **último estado conhecido** e a idade dele (`healthAgeMs`). Uma
+  consulta real só ocorre quando a política lazy/interval/off permite,
+  respeitando o intervalo mínimo e a exclusão mútua.
 - **A transação é o melhor healthcheck.** Um `Pay` aprovado prova que o
-  device responde. O agente só marca "preciso reconsultar" quando o erro
-  sugere perda de comunicação (`AGENT_UNREACHABLE`, `G002`).
+  device responde. Falhas de comunicação marcam a saúde como desatualizada,
+  mas resultado transacional incerto suspende sondagens, até as forçadas,
+  e mensagens cosméticas nesta instância (ver contrato de incerteza abaixo).
 
 No modo padrão (`lazy`), o Slim é consultado **na inicialização e depois de
 uma falha** — mais nada. Use `interval` apenas se o dashboard precisar de
@@ -112,8 +139,20 @@ Todos respondem pelo **ACK** do socket.io. Quem define o timeout é o backend.
 |:--|:--|:--|
 | `tef.pay` | `{ requestId, paymentId, amount, method, installments? }` | `{ ok, approved, receipt }` ou `{ ok: false, error }` |
 | `tef.cancel` | `{ requestId, paymentId, acquirerTransactionKey, amount, transactionType?, panMask? }` | `{ ok, cancelled }` ou `{ ok: false, error }` |
-| `tef.pinpad.message` | `{ message, secondMessage?, formatMessage? }` | `{ ok }` |
-| `tef.healthcheck` | — | `{ ok, health, busy }` |
+| `tef.pinpad.message` | `{ requestId?, paymentId?, message, secondMessage?, formatMessage? }` | `{ ok }` ou `{ ok: false, error }` |
+| `tef.healthcheck` | `{ requestId?, paymentId?, force? }` | `{ ok, health, busy, cached? }` |
+
+Todas as respostas ACK carregam `requestId` e `paymentId` da requisição
+(`null` se ausentes), inclusive `BAD_REQUEST`, `AGENT_BUSY`, exceções e
+reenvios em cache. Pay/Cancel emitem exatamente o mesmo objeto em
+`tef.result`. ACK ausente ou não-função é ignorado. Os logs de resultado
+registram evento, IDs, `ok` e código, nunca ATK, PAN, token ou comprovante.
+Pay/Cancel exigem ambos os IDs como strings não vazias. Reutilizar `requestId`
+com outro `paymentId` ou outra operação devolve `BAD_REQUEST`, sem alterar o
+resultado original nem associar uma aprovação antiga a outro pagamento.
+Falhas de socket registram categorias seguras extraídas de `err.message` ou
+`reason` (por exemplo, `websocket error`, `transport close`, `ping timeout`,
+`authentication error`), nunca o objeto bruto ou texto arbitrário com token.
 
 `method`: `debit` \| `credit`. `amount` em **reais** (float, ex.: `25.80`).
 `installments > 1` usa parcelamento **lojista** (sem juros para o cliente).
@@ -122,7 +161,7 @@ Todos respondem pelo **ACK** do socket.io. Quem define o timeout é o backend.
 
 | Evento | Quando | Payload |
 |:--|:--|:--|
-| `tef.status` | ao conectar e a cada 30s | `{ agentId, laundryId, activated, busy, stoneCode, hasPixKey, ... }` |
+| `tef.status` | ao conectar, a cada 30s e imediatamente ao reservar/liberar a serial | `{ agentId, laundryId, activated, busy, stoneCode, hasPixKey, ... }` |
 | `tef.progress` | o pinpad está esperando o cartão | `{ requestId, paymentId, stage: "waiting_card" }` |
 | `tef.result` | ao fim de `tef.pay`/`tef.cancel` | o mesmo objeto do ACK |
 
@@ -153,10 +192,15 @@ Todos respondem pelo **ACK** do socket.io. Quem define o timeout é o backend.
 
 ## Garantias
 
-- **Uma transação por vez.** O pinpad é recurso único; um segundo `tef.pay`
-  concorrente recebe `AGENT_BUSY` em vez de embaralhar o device.
-- **Idempotência.** Os últimos 50 `requestId` ficam em memória: reenvio do
-  mesmo `requestId` devolve o resultado guardado, sem cobrar de novo.
+- **Uma operação no Slim por vez.** Pay, Cancel, healthcheck e mensagem
+  cosmética compartilham a mesma reserva, liberada em `finally`. Pay/Cancel
+  recebem `AGENT_BUSY` imediatamente se health/message já estiver usando a
+  serial; não há espera ilimitada nem fila. Health concorrente responde cache.
+  Mensagem concorrente recebe `AGENT_BUSY` e é descartada, nunca executada
+  depois de uma aprovação. O backend não deve reenfileirar essas mensagens.
+- **Idempotência.** Os últimos 50 `requestId` ficam em memória: reenvio com
+  os mesmos IDs e operação devolve o resultado guardado, sem cobrar de novo,
+  inclusive durante o bloqueio por incerteza. Conflitos recebem `BAD_REQUEST`.
 - **Ativação antes de conectar.** O agente só entra no socket com o Slim
   ativado — o backend nunca recebe um agente que responderia `G002`.
 
@@ -164,13 +208,56 @@ Todos respondem pelo **ACK** do socket.io. Quem define o timeout é o backend.
 > Para cobrança duplicada ser impossível mesmo com restart, o backend deve
 > checar se o `Payment` já saiu de `pending` antes de reemitir.
 
+## Resultado incerto e botão vermelho
+
+- **`AGENT_RESULT_UNKNOWN`**: Pay recebeu HTTP 2xx, mas não há comprovante
+  válido (JSON inválido, vazio, objeto de erro ou ATK ausente/inválido).
+  Não significa recusa: pode haver cobrança. Não retorna `approved: true`.
+- **`AGENT_UNREACHABLE`**: timeout ou falha de comunicação, inclusive na leitura
+  do corpo após os headers. O mesmo prazo HTTP cobre headers e corpo. Em uma
+  transação também é incerto, não prova que ela foi recusada/cancelada.
+- **`AGENT_ERROR`**: uma exceção inesperada durante Pay/Cancel também é tratada
+  conservadoramente como incerta; um erro de processamento pode ocorrer depois
+  da cobrança. O código original é preservado no resultado/cache.
+- O backend deve manter esses resultados como **pendentes de conciliação**,
+  preservar os IDs e não cobrar novamente nem estornar automaticamente. O
+  agente guarda o resultado no cache, inclusive o incerto; `AGENT_BUSY` e
+  rejeições de novas operações durante o bloqueio não são cacheados.
+- Após qualquer desses resultados transacionais, **novos Pay e Cancel são
+  bloqueados com `AGENT_RESULT_UNKNOWN`**, sem chamar Slim, enfileirar, tentar
+  novamente ou estornar. Reenvios válidos de operações em cache continuam
+  consultáveis, incluindo sucessos anteriores, sem remover o bloqueio.
+- Mensagens cosméticas também recebem `AGENT_RESULT_UNKNOWN`; healthcheck,
+  inclusive forçado, retorna somente cache com `ok: false` e `busy: true`.
+  O status publica **`activated: false`, `busy: true`**, imediatamente e nas
+  próximas publicações, para impedir seleção como agente disponível.
+- Não existe desbloqueio por relógio, healthcheck ou reconexão. **Um operador
+  deve conferir o resultado na Stone e o estado do Slim antes de reiniciar o
+  agente. Reinício NÃO concilia pagamentos e NÃO significa cancelamento**;
+  apenas perde o bloqueio e o cache em memória. A conciliação deve acontecer
+  separadamente antes de autorizar nova cobrança.
+- `tef.cancel` continua sendo **estorno explícito por ATK**, não interrupção de
+  um Pay em andamento. Botão vermelho não dispara endpoint adicional de
+  Confirm/Finish/Cancel nem estorno automático. Nenhum endpoint adicional de
+  confirmação foi estabelecido pelo contrato/documentação disponível.
+
+No incidente relatado, abandono no backend em 120s ocorre antes do timeout
+padrão de Pay (180s). Uma mensagem de abandono não deve disputar a serial nem
+ser reenviada para o display após uma aprovação. A evidência disponível
+(`AGENT_UNREACHABLE` e `abandonedAt` em 120s) não estabelece causa única de
+hardware ou de software; faltam os logs completos da tentativa. Alinhar os
+prazos e conciliar resultados no backend/frontend é uma alteração separada.
+
 ## Particularidades do AutoTEF (validadas em homologação)
 
-- `POST /api/Pay` responde **envelopado** em `{ receipt, card }`; a doc mostra
-  os campos na raiz.
-- `cardReadingType` é **texto** (`EMVProximityReader` = NFC,
-  `EMVContactReader` = chip), não número. O agente normaliza para
-  `nfc`/`chip`.
+- `POST /api/Pay` pode responder **envelopado** em `{ receipt, card }` (observado)
+  ou com os campos na raiz (documentado). Ambos exigem
+  `acquirerTransactionKey` string não vazia; a máscara de `card` é preservada.
+- `cardReadingType` textual (`EMVProximityReader`, `Contactless`,
+  `EMVContactReader`, `Magnetic...`) mantém a normalização existente para
+  `nfc`/`chip`/`magnetic`. Ausente ou numérico, inclusive `8` do exemplo da
+  documentação, vira `null`: não inferimos enum e não invalidamos o comprovante.
+  Parcelas ausentes ou zero normalizam para `1`.
 - No cancelamento em PDV, o `panMask` tem de ser o do objeto `card`
   (`490721*********2003`, **com BIN**). O do `receipt`
   (`************2003`) faz o device recusar com **G004 "use the same card"**
